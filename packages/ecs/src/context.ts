@@ -46,7 +46,6 @@ export interface AppState {
   penbarVisible: boolean;
   penbarAll: Pen[];
   penbarSelected: Pen;
-  penbarDrawSizeLabelVisible: boolean;
   penbarDrawRect: Partial<StrokeAttributes & FillAttributes>;
   penbarDrawEllipse: Partial<StrokeAttributes & FillAttributes>;
   penbarDrawLine: Partial<StrokeAttributes>;
@@ -65,10 +64,10 @@ export interface AppState {
   >;
   penbarBrush: Partial<
     BrushAttributes &
-    StrokeAttributes & {
-      stamps: { src: string; name: string; preview: string }[];
-      stamp: string;
-    }
+      StrokeAttributes & {
+        stamps: { src: string; name: string; preview: string }[];
+        stamp: string;
+      }
   >;
   penbarText: Partial<
     TextSerializedNode & {
@@ -76,14 +75,15 @@ export interface AppState {
     }
   >;
   penbarLasso: Partial<
-    FillAttributes & StrokeAttributes & {
-      mode: 'draw' | 'select';
-      trailStroke: string;
-      trailFill: string;
-      trailFillOpacity: number;
-      trailStrokeDasharray: string;
-      trailStrokeDashoffset: string;
-    }
+    FillAttributes &
+      StrokeAttributes & {
+        mode: 'draw' | 'select';
+        trailStroke: string;
+        trailFill: string;
+        trailFillOpacity: number;
+        trailStrokeDasharray: string;
+        trailStrokeDashoffset: string;
+      }
   >;
   taskbarVisible: boolean;
   taskbarAll: Task[];
@@ -97,10 +97,6 @@ export interface AppState {
    * Allow rotate in transformer
    */
   rotateEnabled: boolean;
-  /**
-   * Allow flip in transformer
-   */
-  flipEnabled: boolean;
 
   /**
    * Allow snap to pixel grid
@@ -199,7 +195,6 @@ export const getDefaultAppState: () => AppState = () => {
       Pen.LASER_POINTER,
     ],
     penbarSelected: Pen.HAND,
-    penbarDrawSizeLabelVisible: true,
     penbarDrawRect: {
       fill: TRANSFORMER_MASK_FILL_COLOR,
       fillOpacity: 0.5,
@@ -316,7 +311,6 @@ export const getDefaultAppState: () => AppState = () => {
     propertiesOpened: [],
     layersExpanded: [],
     rotateEnabled: false,
-    flipEnabled: false,
     snapToPixelGridEnabled: false,
     snapToPixelGridSize: 10,
     snapToObjectsEnabled: false,

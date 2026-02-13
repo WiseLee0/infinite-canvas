@@ -158,7 +158,7 @@ export class TextEditor extends LitElement {
       this.editable.style.height = `${obb.height}px`;
 
       this.api.deselectNodes([node]);
-      this.api.unhighlightNodes([node]);
+      this.api.unhighlightNodes([node.id]);
       // Hide original text node for now.
       this.api.updateNode(
         node,

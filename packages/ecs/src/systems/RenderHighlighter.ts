@@ -56,6 +56,10 @@ export class RenderHighlighter extends System {
     q.added.and.removed.with(Highlighted),
   );
 
+  private readonly highlightedChanged = this.query(
+    (q) => q.changed.with(Highlighted).trackWrites,
+  );
+
   private readonly bounds = this.query(
     (q) => q.changed.with(ComputedBounds).trackWrites,
   );
@@ -135,6 +139,13 @@ export class RenderHighlighter extends System {
       this.remove(highlighted, camera);
     });
 
+    this.highlightedChanged.changed.forEach((entity) => {
+      if (entity.has(Highlighted)) {
+        const camera = getSceneRoot(entity);
+        this.createOrUpdate(entity, camera);
+      }
+    });
+
     this.bounds.changed.forEach((entity) => {
       if (entity.has(Highlighted)) {
         const camera = getSceneRoot(entity);
@@ -178,6 +189,10 @@ export class RenderHighlighter extends System {
     safeRemoveComponent(highlighter, Path);
     safeRemoveComponent(highlighter, Polyline);
     highlighter.write(Visibility).value = 'visible';
+
+    // Use stroke width from Highlighted component (2 for hover, 1 for brush selection)
+    const { strokeWidth } = entity.read(Highlighted);
+    highlighter.write(Stroke).width = strokeWidth;
 
     const {
       obb: { x, y, width, height, rotation, scaleX, scaleY },

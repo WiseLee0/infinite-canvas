@@ -1,5 +1,5 @@
-import { AppState, SerializedNode } from "@infinite-canvas-tutorial/ecs";
-import { ExtendedAPI } from "../API";
+import { AppState, SerializedNode } from '@infinite-canvas-tutorial/ecs';
+import { ExtendedAPI } from '../API';
 
 export function updateAndSelectNodes(
   api: ExtendedAPI,
@@ -11,9 +11,7 @@ export function updateAndSelectNodes(
     api.record();
 
     setTimeout(() => {
-      api.unhighlightNodes(
-        appState.layersHighlighted.map((id) => api.getNodeById(id)),
-      );
+      api.unhighlightNodes(appState.layersHighlighted);
       api.selectNodes([nodes[0]]);
     }, 100);
   });

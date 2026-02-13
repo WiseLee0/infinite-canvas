@@ -12,10 +12,37 @@ export class AppStateChange implements Change<AppState> {
   private constructor(
     private readonly delta: Delta<AppState>,
     private readonly api: API,
-  ) { }
+  ) {}
 
   static empty() {
     return new AppStateChange(Delta.create({}, {}), undefined);
+  }
+
+  /**
+   * Keys excluded from undo/redo history because they represent
+   * ephemeral state (camera navigation, hover highlights).
+   */
+  private static readonly IGNORED_KEYS: ReadonlySet<string> = new Set([
+    'cameraZoom',
+    'cameraX',
+    'cameraY',
+    'cameraRotation',
+    'cameraZoomFactor',
+    // Hover highlights are transient; only selection highlights
+    // should be restored via layersSelected during undo/redo.
+    'layersHighlighted',
+  ]);
+
+  private static stripCameraProps(
+    partial: Partial<AppState>,
+  ): Partial<AppState> {
+    const result: Partial<AppState> = {};
+    for (const key of Object.keys(partial)) {
+      if (!AppStateChange.IGNORED_KEYS.has(key)) {
+        (result as any)[key] = (partial as any)[key];
+      }
+    }
+    return result;
   }
 
   static calculate<T extends AppState>(
@@ -26,7 +53,7 @@ export class AppStateChange implements Change<AppState> {
     const delta = Delta.calculate(
       prevAppState,
       nextAppState,
-      undefined,
+      AppStateChange.stripCameraProps as any,
       // AppStateChange.postProcess,
     );
 
@@ -84,21 +111,12 @@ export class AppStateChange implements Change<AppState> {
     if (this.api) {
       this.api.setAppState(nextAppState);
 
-      // reselect or rehighlight nodes
-      const {
-        layersHighlighted: prevLayersHighlighted,
-        layersSelected: prevLayersSelected,
-      } = appState;
-      const { layersHighlighted, layersSelected } = nextAppState;
-      if (layersSelected.length > 0) {
-        this.api.selectNodes(
-          layersSelected
-            .map((id) => this.api.getNodeById(id))
-            .filter((node) => node !== undefined),
-          false,
-          false,
-        );
-      }
+      // Restore selection state: deselect previous, then select new.
+      // Highlights are derived from selection only (hover highlights
+      // are ephemeral and not restored during undo/redo).
+      const { layersSelected: prevLayersSelected } = appState;
+      const { layersSelected } = nextAppState;
+
       if (prevLayersSelected.length > 0) {
         this.api.deselectNodes(
           prevLayersSelected
@@ -106,22 +124,13 @@ export class AppStateChange implements Change<AppState> {
             .filter((node) => node !== undefined),
         );
       }
-
-      if (layersHighlighted.length > 0) {
-        this.api.highlightNodes(
-          layersHighlighted
+      if (layersSelected.length > 0) {
+        this.api.selectNodes(
+          layersSelected
             .map((id) => this.api.getNodeById(id))
             .filter((node) => node !== undefined),
           false,
           false,
-        );
-      }
-
-      if (prevLayersHighlighted.length > 0) {
-        this.api.unhighlightNodes(
-          prevLayersHighlighted
-            .map((id) => this.api.getNodeById(id))
-            .filter((node) => node !== undefined),
         );
       }
     }

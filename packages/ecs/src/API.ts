@@ -105,7 +105,7 @@ export class DefaultStateManagement implements StateManagement {
     this.#nodes = nodes;
   }
 
-  onChange(snapshot: { appState: AppState; nodes: SerializedNode[] }) { }
+  onChange(snapshot: { appState: AppState; nodes: SerializedNode[] }) {}
 }
 
 export const mapToArray = <T extends { id: string } | string>(
@@ -173,7 +173,10 @@ export class API {
       }
 
       // 保持向后兼容：如果设置了 onchange，当有任何变化时都会触发
-      if (this.onchange && (!event.elementsChange.isEmpty() || !event.appStateChange.isEmpty())) {
+      if (
+        this.onchange &&
+        (!event.elementsChange.isEmpty() || !event.appStateChange.isEmpty())
+      ) {
         this.onchange(snapshot);
       }
     });
@@ -793,6 +796,8 @@ export class API {
     preserveSelection = false,
     updateAppState = true,
   ) {
+    // Clear all highlights when selection changes.
+
     if (!preserveSelection) {
       this.getAppState().layersSelected.forEach((id) => {
         const entity = this.#idEntityMap.get(id)?.id();
@@ -803,15 +808,13 @@ export class API {
     }
 
     const prevAppState = this.getAppState();
-    // remove duplicates
-    const layersSelected = preserveSelection
-      ? [
-        ...prevAppState.layersSelected,
-        ...nodes.map((node) => node.id),
-      ].filter((id, index, self) => self.indexOf(id) === index)
-      : nodes
-        .map((node) => node.id)
-        .filter((id, index, self) => self.indexOf(id) === index);
+    const layersSelected = [
+      ...new Set(
+        preserveSelection
+          ? [...prevAppState.layersSelected, ...nodes.map((node) => node.id)]
+          : nodes.map((node) => node.id),
+      ),
+    ];
     if (updateAppState) {
       this.setAppState({
         ...prevAppState,
@@ -826,9 +829,14 @@ export class API {
         entity.add(Selected, { camera: this.#camera });
       }
     });
+
+    this.highlightNodes(layersSelected, false, false, 1);
   }
 
   deselectNodes(nodes: SerializedNode[]) {
+    // Clear all highlights when selection changes.
+    this.highlightNodes([]);
+
     nodes.forEach((node) => {
       const entity = this.#idEntityMap.get(node.id)?.id();
       if (entity && entity.has(Selected)) {
@@ -846,29 +854,34 @@ export class API {
   }
 
   highlightNodes(
-    nodes: SerializedNode[],
+    nodeIds: string[],
     preserveSelection = false,
     updateAppState = true,
+    strokeWidth = 2,
   ) {
+    const newIdSet = new Set(nodeIds);
+
     if (!preserveSelection) {
       this.getAppState().layersHighlighted.forEach((id) => {
-        const entity = this.#idEntityMap.get(id)?.id();
-        if (entity && entity.has(Highlighted)) {
-          entity.remove(Highlighted);
+        // Only remove Highlighted from entities not in the new list
+        // to avoid unnecessary component churn (remove + re-add).
+        if (!newIdSet.has(id)) {
+          const entity = this.#idEntityMap.get(id)?.id();
+          if (entity && entity.has(Highlighted)) {
+            entity.remove(Highlighted);
+          }
         }
       });
     }
 
     const prevAppState = this.getAppState();
-    // remove duplicates
-    const layersHighlighted = preserveSelection
-      ? [
-        ...prevAppState.layersHighlighted,
-        ...nodes.map((node) => node.id),
-      ].filter((id, index, self) => self.indexOf(id) === index)
-      : nodes
-        .map((node) => node.id)
-        .filter((id, index, self) => self.indexOf(id) === index);
+    const layersHighlighted = [
+      ...new Set(
+        preserveSelection
+          ? [...prevAppState.layersHighlighted, ...nodeIds]
+          : nodeIds,
+      ),
+    ];
     if (updateAppState) {
       this.setAppState({
         ...prevAppState,
@@ -878,15 +891,21 @@ export class API {
 
     layersHighlighted.forEach((id) => {
       const entity = this.#idEntityMap.get(id)?.id();
-      if (entity && !entity.has(Highlighted)) {
-        entity.add(Highlighted);
+      if (entity) {
+        if (!entity.has(Highlighted)) {
+          entity.add(Highlighted, { strokeWidth });
+        } else if (newIdSet.has(id)) {
+          // Update strokeWidth for entities that stay highlighted
+          // (e.g. selection highlight width=1 vs hover highlight width=2).
+          entity.write(Highlighted).strokeWidth = strokeWidth;
+        }
       }
     });
   }
 
-  unhighlightNodes(nodes: SerializedNode[]) {
-    nodes.forEach((node) => {
-      const entity = this.#idEntityMap.get(node.id)?.id();
+  unhighlightNodes(nodeIds: string[]) {
+    nodeIds.forEach((id) => {
+      const entity = this.#idEntityMap.get(id)?.id();
       if (entity && entity.has(Highlighted)) {
         entity.remove(Highlighted);
       }
@@ -896,7 +915,7 @@ export class API {
     this.setAppState({
       ...prevAppState,
       layersHighlighted: prevAppState.layersHighlighted.filter(
-        (id) => !nodes.map((node) => node.id).includes(id),
+        (id) => !nodeIds.includes(id),
       ),
     });
   }
@@ -914,6 +933,12 @@ export class API {
     const nodes = this.getNodes();
 
     if (!entity) {
+      // Establish baseline snapshot before adding the new node so that
+      // subsequent record(IMMEDIATELY) calls can correctly compute deltas.
+      if (this.#store.snapshot.isEmpty()) {
+        this.record(CaptureUpdateAction.NEVER);
+      }
+
       const cameraEntityCommands = this.commands.entity(this.#camera);
 
       // TODO: Calculate diffs and only update the changed nodes.
@@ -940,7 +965,13 @@ export class API {
         this.setNodes([...nodes, node]);
       }
     } else {
-      const updated = mutateElement(entity, node, diff ?? node, skipOverrideKeys, this);
+      const updated = mutateElement(
+        entity,
+        node,
+        diff ?? node,
+        skipOverrideKeys,
+        this,
+      );
       const index = nodes.findIndex((n) => n.id === updated.id);
 
       this.commands.execute();
@@ -1003,9 +1034,15 @@ export class API {
         this.updateNode(node, undefined, updateAppState);
       });
     }
+
+    // Establish baseline snapshot after adding new nodes so that
+    // subsequent record(IMMEDIATELY) calls can correctly compute deltas.
+    if (nonExistentNodes.length > 0 && this.#store.snapshot.isEmpty()) {
+      this.record(CaptureUpdateAction.NEVER);
+    }
   }
 
-  updateNodeVectorNetwork(node: SerializedNode, vectorNetwork: VectorNetwork) { }
+  updateNodeVectorNetwork(node: SerializedNode, vectorNetwork: VectorNetwork) {}
 
   updateNodeOBB(
     node: SerializedNode,
@@ -1086,9 +1123,22 @@ export class API {
         (diff as PathSerializedNode).d = shiftPath(d, -minX, -minY);
       } else if (node.type === 'line' || node.type === 'rough-line') {
         const { x1, y1, x2, y2 } = oldNode as LineSerializedNode;
-        const [newX1, newY1] = vec2.transformMat3(vec2.create(), [x1, y1], delta);
-        const [newX2, newY2] = vec2.transformMat3(vec2.create(), [x2, y2], delta);
-        const { minX, minY } = Line.getGeometryBounds({ x1: newX1, y1: newY1, x2: newX2, y2: newY2 });
+        const [newX1, newY1] = vec2.transformMat3(
+          vec2.create(),
+          [x1, y1],
+          delta,
+        );
+        const [newX2, newY2] = vec2.transformMat3(
+          vec2.create(),
+          [x2, y2],
+          delta,
+        );
+        const { minX, minY } = Line.getGeometryBounds({
+          x1: newX1,
+          y1: newY1,
+          x2: newX2,
+          y2: newY2,
+        });
         (diff as LineSerializedNode).x1 = newX1 - minX;
         (diff as LineSerializedNode).y1 = newY1 - minY;
         (diff as LineSerializedNode).x2 = newX2 - minX;
@@ -1170,7 +1220,7 @@ export class API {
     });
 
     this.deselectNodes(deletedNodes);
-    this.unhighlightNodes(deletedNodes);
+    this.unhighlightNodes(deletedNodes.map((node) => node.id));
 
     deletedNodes.forEach((node) => {
       const entity = this.#idEntityMap.get(node.id);
@@ -1222,7 +1272,11 @@ export class API {
 
   reparentNode(node: SerializedNode, parent: SerializedNode) {
     // Modify x,y to be relative to the parent
-    this.updateNode(node, { parentId: parent.id, x: (node.x as number) - (parent.x as number), y: (node.y as number) - (parent.y as number) });
+    this.updateNode(node, {
+      parentId: parent.id,
+      x: (node.x as number) - (parent.x as number),
+      y: (node.y as number) - (parent.y as number),
+    });
   }
 
   /**
@@ -1318,6 +1372,10 @@ export class API {
         this.getAppState(),
         this.#store.snapshot,
       );
+
+      // Update snapshot after undo so that subsequent record() calls
+      // compare against the post-undo state, not the stale pre-undo state.
+      this.record(CaptureUpdateAction.NEVER);
     });
   }
 
@@ -1328,6 +1386,10 @@ export class API {
         this.getAppState(),
         this.#store.snapshot,
       );
+
+      // Update snapshot after redo so that subsequent record() calls
+      // compare against the post-redo state, not the stale pre-redo state.
+      this.record(CaptureUpdateAction.NEVER);
     });
   }
 

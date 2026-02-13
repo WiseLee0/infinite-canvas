@@ -9,8 +9,8 @@ import { Event, UIPlugin } from '../../webcomponents/src';
 import '../../webcomponents/src/spectrum';
 import { setupZoomToolbar } from '../src/zoom-toolbar';
 
-const COLS = 2;
-const ROWS = 2;
+const COLS = 3;
+const ROWS = 3;
 const IMAGE_SIZE = 512;
 const GAP = 20;
 
@@ -44,6 +44,11 @@ canvas.addEventListener(Event.READY, (e) => {
     }
   }
   api.updateNodes(nodes);
+
+  // 等待 ECS 计算完节点 bounds 后，自适应缩放到合适大小
+  requestAnimationFrame(() => {
+    api.fitToScreen();
+  });
 });
 
 try {

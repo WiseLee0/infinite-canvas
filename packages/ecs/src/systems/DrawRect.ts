@@ -51,7 +51,6 @@ import {
   snapToGrid,
 } from '../utils';
 import { DRAW_RECT_Z_INDEX } from '../context';
-import { DOMAdapter, Event, TRANSFORMER_ANCHOR_STROKE_COLOR } from '..';
 
 const PEN_TO_TYPE = {
   [Pen.DRAW_RECT]: 'rect',
@@ -71,7 +70,6 @@ interface DrawRectSelection {
   roughRectBrush: RoughRectSerializedNode;
   roughEllipseBrush: RoughEllipseSerializedNode;
   roughLineBrush: RoughPolylineSerializedNode;
-  label: HTMLDivElement;
   x: number;
   y: number;
   width: number;
@@ -185,19 +183,12 @@ export class DrawRect extends System {
           roughRectBrush: undefined,
           roughEllipseBrush: undefined,
           roughLineBrush: undefined,
-          label: DOMAdapter.get().getDocument().createElement('div'),
           x: 0,
           y: 0,
           width: 0,
           height: 0,
         };
         this.selections.set(camera.__id, selection);
-
-        if (isBrowser) {
-          const { label } = selection;
-          initLabel(label);
-          api.getSvgLayer().appendChild(selection.label);
-        }
       }
 
       // Dragging
@@ -225,9 +216,6 @@ export class DrawRect extends System {
 
       if (input.pointerUpTrigger) {
         const selection = this.selections.get(camera.__id);
-        if (isBrowser && selection.label.style.visibility === 'hidden') {
-          return;
-        }
 
         const { x, y, width, height } = selection;
 
@@ -248,25 +236,25 @@ export class DrawRect extends System {
             | RoughEllipseSerializedNode
             | RoughRectSerializedNode
             | RoughPolylineSerializedNode = Object.assign(
-              {
-                id: uuidv4(),
-                type: PEN_TO_TYPE[pen],
-                version: 0,
-              },
-              defaultDrawParams[pen],
-              pen === Pen.DRAW_LINE ||
-                pen === Pen.DRAW_ARROW ||
-                pen === Pen.DRAW_ROUGH_LINE
-                ? {
+            {
+              id: uuidv4(),
+              type: PEN_TO_TYPE[pen],
+              version: 0,
+            },
+            defaultDrawParams[pen],
+            pen === Pen.DRAW_LINE ||
+              pen === Pen.DRAW_ARROW ||
+              pen === Pen.DRAW_ROUGH_LINE
+              ? {
                   points: `${x},${y} ${x + width},${y + height}`,
                 }
-                : {
+              : {
                   x,
                   y,
                   width,
                   height,
                 },
-            );
+          );
           api.setAppState({
             penbarSelected: Pen.SELECT,
           });
@@ -292,9 +280,6 @@ export class DrawRect extends System {
   }
 
   finalize(): void {
-    this.selections.forEach((selection) => {
-      selection.label.remove();
-    });
     this.selections.clear();
   }
 
@@ -332,16 +317,16 @@ export class DrawRect extends System {
         pen === Pen.DRAW_RECT
           ? selection.rectBrush
           : pen === Pen.DRAW_ROUGH_RECT
-            ? selection.roughRectBrush
-            : pen === Pen.DRAW_ELLIPSE
-              ? selection.ellipseBrush
-              : pen === Pen.DRAW_LINE
-                ? selection.lineBrush
-                : pen === Pen.DRAW_ROUGH_ELLIPSE
-                  ? selection.roughEllipseBrush
-                  : pen === Pen.DRAW_ROUGH_LINE
-                    ? selection.roughLineBrush
-                    : selection.arrowBrush;
+          ? selection.roughRectBrush
+          : pen === Pen.DRAW_ELLIPSE
+          ? selection.ellipseBrush
+          : pen === Pen.DRAW_LINE
+          ? selection.lineBrush
+          : pen === Pen.DRAW_ROUGH_ELLIPSE
+          ? selection.roughEllipseBrush
+          : pen === Pen.DRAW_ROUGH_LINE
+          ? selection.roughLineBrush
+          : selection.arrowBrush;
       if (!brush) {
         // @ts-expect-error
         brush = Object.assign(
@@ -356,14 +341,14 @@ export class DrawRect extends System {
             pen === Pen.DRAW_ARROW ||
             pen === Pen.DRAW_ROUGH_LINE
             ? {
-              points: '0,0 0,0',
-            }
+                points: '0,0 0,0',
+              }
             : {
-              x: 0,
-              y: 0,
-              width: 0,
-              height: 0,
-            },
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+              },
         );
         api.updateNode(brush, undefined, false);
         if (pen === Pen.DRAW_RECT) {
@@ -432,24 +417,20 @@ export class DrawRect extends System {
           pen === Pen.DRAW_ARROW ||
           pen === Pen.DRAW_ROUGH_LINE
           ? {
-            ...defaultDrawParams,
-            visibility: 'visible',
-            points: `${x},${y} ${cx},${cy}`,
-          }
+              ...defaultDrawParams,
+              visibility: 'visible',
+              points: `${x},${y} ${cx},${cy}`,
+            }
           : {
-            ...defaultDrawParams,
-            visibility: 'visible',
-            x,
-            y,
-            width,
-            height,
-          },
+              ...defaultDrawParams,
+              visibility: 'visible',
+              x,
+              y,
+              width,
+              height,
+            },
         false,
       );
-
-      const { label } = selection;
-
-      showLabel(label, api, { x, y, width, height, rotate: isLine });
 
       // Update the selection state
       selection.x = x;
@@ -465,7 +446,6 @@ export class DrawRect extends System {
     if (brush) {
       api.updateNode(brush, { visibility: 'hidden' }, false);
     }
-    hideLabel(selection.label);
   }
 
   private getBrush(selection: DrawRectSelection, pen: Pen) {
@@ -482,86 +462,16 @@ export class DrawRect extends System {
       pen === Pen.DRAW_RECT
         ? rectBrush
         : pen === Pen.DRAW_ROUGH_RECT
-          ? roughRectBrush
-          : pen === Pen.DRAW_ROUGH_ELLIPSE
-            ? roughEllipseBrush
-            : pen === Pen.DRAW_ELLIPSE
-              ? ellipseBrush
-              : pen === Pen.DRAW_LINE
-                ? lineBrush
-                : pen === Pen.DRAW_ROUGH_LINE
-                  ? roughLineBrush
-                  : arrowBrush;
+        ? roughRectBrush
+        : pen === Pen.DRAW_ROUGH_ELLIPSE
+        ? roughEllipseBrush
+        : pen === Pen.DRAW_ELLIPSE
+        ? ellipseBrush
+        : pen === Pen.DRAW_LINE
+        ? lineBrush
+        : pen === Pen.DRAW_ROUGH_LINE
+        ? roughLineBrush
+        : arrowBrush;
     return brush;
-  }
-}
-
-export function initLabel(label: HTMLDivElement) {
-  if (isBrowser) {
-    label.style.position = 'absolute';
-    label.style.top = '0';
-    label.style.left = '0';
-    label.style.display = 'flex';
-    label.style.alignItems = 'center';
-    label.style.justifyContent = 'center';
-    label.style.padding = '4px';
-    label.style.borderRadius = '4px';
-    label.style.backgroundColor = TRANSFORMER_ANCHOR_STROKE_COLOR;
-    label.style.color = 'white';
-    label.style.visibility = 'hidden';
-  }
-}
-
-export function hideLabel(label: HTMLDivElement) {
-  if (isBrowser) {
-    label.style.visibility = 'hidden';
-  }
-}
-
-export function showLabel(
-  label: HTMLDivElement,
-  api: API,
-  {
-    x,
-    y,
-    width,
-    height,
-    rotate,
-  }: { x: number; y: number; width: number; height: number; rotate?: boolean },
-) {
-  if (isBrowser) {
-    if (api.getAppState().penbarDrawSizeLabelVisible) {
-      label.style.visibility = 'visible';
-    }
-
-    label.innerText = `${Math.round(Math.abs(width))} × ${Math.round(
-      Math.abs(height),
-    )}`;
-
-    if (rotate) {
-      const { x: viewportX2, y: viewportY2 } = api.canvas2Viewport({
-        x: x + width / 2,
-        y: y + height / 2,
-      });
-      label.style.top = `${viewportY2}px`;
-      label.style.left = `${viewportX2}px`;
-      const rad = Math.atan2(height, width);
-      let deg = rad * (180 / Math.PI);
-      if (deg >= 90 && deg <= 180) {
-        deg = deg - 180;
-      } else if (deg <= -90 && deg >= -180) {
-        deg = deg + 180;
-      }
-      // Rotate the label to the direction of the line
-      label.style.transform = `translate(-50%, -50%) rotate(${deg}deg)`;
-    } else {
-      const { x: viewportX2, y: viewportY2 } = api.canvas2Viewport({
-        x: x + width / 2,
-        y: y + height,
-      });
-      label.style.top = `${viewportY2}px`;
-      label.style.left = `${viewportX2}px`;
-      label.style.transform = 'translate(-50%, 8px)';
-    }
   }
 }

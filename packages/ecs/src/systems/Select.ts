@@ -1,5 +1,5 @@
 import { Entity, System } from '@lastolivegames/becsy';
-import { mat3 } from 'gl-matrix';
+import { mat3, vec2 } from 'gl-matrix';
 import {
   Camera,
   Canvas,
@@ -47,6 +47,7 @@ import {
   Editable,
   Locked,
   Line,
+  Mat3,
 } from '../components';
 import { Commands } from '../commands/Commands';
 import {
@@ -65,14 +66,17 @@ import { API } from '../API';
 import {
   getOBB,
   hitTest,
+  setTransformerVisibility,
+  syncMaskTransform,
   TRANSFORMER_ANCHOR_STROKE_COLOR,
   TRANSFORMER_MASK_FILL_COLOR,
 } from './RenderTransformer';
 import { updateGlobalTransform } from './Transform';
 import { safeAddComponent } from '../history';
 import { updateComputedPoints } from './ComputePoints';
-import { DOMAdapter } from '../environment';
-import { hideLabel, initLabel, showLabel } from '..';
+
+/** Minimum pointer distance (in viewport pixels) to distinguish a drag from a click. */
+const DRAG_THRESHOLD = 3;
 
 export enum SelectionMode {
   IDLE = 'IDLE',
@@ -120,11 +124,23 @@ export interface SelectOBB {
   pointerMoveViewportX: number;
   pointerMoveViewportY: number;
 
+  pointerDownViewportX: number;
+  pointerDownViewportY: number;
+  pointerDownShiftKey: boolean;
+  pointerDownSelectionHandled: boolean;
+
+  // Saved mask transform matrices from saveSelectedOBB time.
+  // Used during resize to avoid feedback loop caused by mask drifting.
+  savedMaskMatrix: mat3;
+  savedMaskMatrixInv: mat3;
+
   brushContainer: SVGSVGElement;
   snapContainer: SVGSVGElement;
-  label: HTMLDivElement;
 
   editing: Entity;
+
+  /** Cached hover target from the previous pointer-move to skip redundant highlight rebuilds. */
+  prevHoverEntity: Entity | undefined;
 }
 
 /**
@@ -209,6 +225,9 @@ export class Select extends System {
   ) {
     const { snapToPixelGridSize, snapToPixelGridEnabled } = api.getAppState();
     const camera = api.getCamera();
+
+    const isFirstMoveFrame =
+      camera.read(Transformable).status !== TransformableStatus.MOVING;
     camera.write(Transformable).status = TransformableStatus.MOVING;
 
     const selection = this.selections.get(camera.__id);
@@ -237,13 +256,19 @@ export class Select extends System {
       offset = [ex - sx, ey - sy];
     }
 
-    const { selecteds, mask } = camera.read(Transformable);
+    const { selecteds } = camera.read(Transformable);
+
+    // Hide transformer and highlighters only once on the first move frame.
+    if (isFirstMoveFrame) {
+      setTransformerVisibility(camera, false);
+      selecteds.forEach((selected) => {
+        if (selected.has(Highlighted)) {
+          selected.remove(Highlighted);
+        }
+      });
+    }
 
     selecteds.forEach((selected) => {
-      // Hide transformer and highlighter
-      if (selected.has(Highlighted)) {
-        selected.remove(Highlighted);
-      }
       const node = api.getNodeByEntity(selected);
       const { x, y } = selected.read(Transform).translation;
       api.updateNodeOBB(node, {
@@ -253,15 +278,6 @@ export class Select extends System {
       updateGlobalTransform(selected);
       updateComputedPoints(selected);
     });
-
-    updateGlobalTransform(mask);
-
-    // showLabel(selection.label, api, {
-    //   x: .x,
-    //   y: obb.y,
-    //   width: obb.width,
-    //   height: obb.height,
-    // });
   }
 
   private handleSelectedMoved(api: API, selection: SelectOBB) {
@@ -271,411 +287,331 @@ export class Select extends System {
     api.record();
 
     const { selecteds } = camera.read(Transformable);
+
+    // Restore mask and anchor visibility after move.
+    setTransformerVisibility(camera, true);
+
     selecteds.forEach((selected) => {
       if (!selected.has(Highlighted)) {
-        selected.add(Highlighted);
+        selected.add(Highlighted, { strokeWidth: 1 });
       }
     });
+
+    // 移动完成后立即同步更新 mask 的位置，避免等到 RenderTransformer
+    // 使用过时的 ComputedBounds 来更新（滞后一帧）。
+    syncMaskTransform(camera, getOBB(camera));
 
     camera.write(Transformable).status = TransformableStatus.MOVED;
 
     this.saveSelectedOBB(api, selection);
-    hideLabel(selection.label);
-  }
-
-  private handleSelectedRotating(
-    api: API,
-    anchorNodeX: number,
-    anchorNodeY: number,
-  ) {
-    // const camera = api.getCamera();
-    // const { mask } = camera.read(Transformable);
-    // camera.write(Transformable).status = TransformableStatus.ROTATING;
-    // const { obb } = this.selections.get(camera.__id);
-    // const sl = api.canvas2Transformer(
-    //   {
-    //     x: anchorNodeX,
-    //     y: anchorNodeY,
-    //   },
-    //   mask,
-    // );
-    // const x = sl.x - obb.width / 2;
-    // const y = sl.y - obb.height / 2;
-    // let delta = Math.atan2(-y, x) + Math.PI / 2;
-    // const {
-    //   scale: { sx, sy },
-    //   rotation: { angle },
-    //   translate: { tx, ty },
-    // } = decomposeTSR(
-    //   rotateDEG(delta * RAD_TO_DEG, this.#center[0], this.#center[1]),
-    // );
-    // this.fitSelected(api, {
-    //   x: obb.minX,
-    //   y: obb.minY,
-    //   width: obb.maxX - obb.minX,
-    //   height: obb.maxY - obb.minY,
-    //   transform: {
-    //     scale: { x: sx, y: sy },
-    //     rotation: angle,
-    //     translation: { x: tx, y: ty },
-    //   },
-    // });
   }
 
   private handleSelectedResizing(
     api: API,
     canvasX: number,
     canvasY: number,
-    lockAspectRatio: boolean,
-    centeredScaling: boolean,
     selection: SelectOBB,
   ) {
     const camera = api.getCamera();
-    const { resizingAnchorName, obb, cos, sin, label } = selection;
-    const { rotation, scaleX, scaleY } = obb;
-
-    // Use the lock aspect ratio of the selected node if there is only one
-    const { layersSelected, flipEnabled } = api.getAppState();
-    if (layersSelected.length === 1) {
-      const node = api.getNodeById(layersSelected[0]);
-      lockAspectRatio = node.lockAspectRatio ?? lockAspectRatio;
-    }
-
     camera.write(Transformable).status = TransformableStatus.RESIZING;
 
-    if (
-      resizingAnchorName === AnchorName.X1Y1 ||
-      resizingAnchorName === AnchorName.X2Y2
-    ) {
-      const { x1y1Anchor, x2y2Anchor, lineMask } = camera.read(Transformable);
-      const { x, y } = api.canvas2Transformer(
-        {
-          x: canvasX,
-          y: canvasY,
-        },
-        lineMask,
-      );
+    const { mask } = camera.read(Transformable);
+    const { resizingAnchorName, cos, sin } = selection;
 
-      const isX1Y1 = resizingAnchorName === AnchorName.X1Y1;
-      const isX2Y2 = resizingAnchorName === AnchorName.X2Y2;
-      if (isX1Y1) {
-        Object.assign(x1y1Anchor.write(Circle), {
-          cx: x,
-          cy: y,
-        });
-      } else if (isX2Y2) {
-        Object.assign(x2y2Anchor.write(Circle), {
-          cx: x,
-          cy: y,
-        });
-      }
+    // 使用保存的 mask 矩阵将光标转换到 mask 本地坐标。
+    // 避免 mask 每帧漂移导致的反馈循环。
+    const cursorInLocal = selection.savedMaskMatrixInv
+      ? vec2.transformMat3(
+          vec2.create(),
+          [canvasX, canvasY],
+          selection.savedMaskMatrixInv,
+        )
+      : (() => {
+          const p = api.canvas2Transformer({ x: canvasX, y: canvasY }, mask);
+          return [p.x, p.y] as [number, number];
+        })();
+    const x = cursorInLocal[0];
+    const y = cursorInLocal[1];
 
-      const node = api.getNodeById(layersSelected[0]);
-      const { cx: x1y1Cx, cy: x1y1Cy } = x1y1Anchor.read(Circle);
-      const { cx: x2y2Cx, cy: x2y2Cy } = x2y2Anchor.read(Circle);
-      const points = [
-        [x1y1Cx, x1y1Cy],
-        [x2y2Cx, x2y2Cy],
-      ];
+    this.updateAnchorPositions(camera, resizingAnchorName, x, y, cos, sin);
+    this.computeOBBFromSavedMask(
+      api,
+      resizingAnchorName,
+      x,
+      y,
+      cos,
+      sin,
+      selection,
+    );
+  }
 
-      if (node.type === 'line' || node.type === 'rough-line') {
-        api.updateNode(node, {
-          x1: x1y1Cx,
-          y1: x1y1Cy,
-          x2: x2y2Cx,
-          y2: x2y2Cy,
-        });
-      } else {
-        api.updateNode(node, {
-          points: points.map((point) => point.join(',')).join(' '),
-        });
-      }
+  /**
+   * Update anchor positions based on cursor position and enforce aspect ratio.
+   */
+  private updateAnchorPositions(
+    camera: Entity,
+    anchorName: AnchorName,
+    x: number,
+    y: number,
+    cos: number,
+    sin: number,
+  ) {
+    const { tlAnchor, trAnchor, blAnchor, brAnchor } =
+      camera.read(Transformable);
+    const prevTlAnchorX = tlAnchor.read(Circle).cx;
+    const prevTlAnchorY = tlAnchor.read(Circle).cy;
+    const prevBrAnchorX = brAnchor.read(Circle).cx;
+    const prevBrAnchorY = brAnchor.read(Circle).cy;
 
-      const selected = api.getEntity(node);
-      updateGlobalTransform(selected);
-      updateComputedPoints(selected);
-
-      {
-        const cx = canvasX;
-        const cy = canvasY;
-        const { x, y } = api.transformer2Canvas(
-          {
-            x: isX1Y1 ? x2y2Cx : x1y1Cx,
-            y: isX1Y1 ? x2y2Cy : x1y1Cy,
-          },
-          lineMask,
-        );
-        const width = cx - x;
-        const height = cy - y;
-        showLabel(label, api, {
-          x,
-          y,
-          width,
-          height,
-          rotate: true,
-        });
-      }
-    } else {
-      const { tlAnchor, trAnchor, blAnchor, brAnchor, mask } =
-        camera.read(Transformable);
-      const prevTlAnchorX = tlAnchor.read(Circle).cx;
-      const prevTlAnchorY = tlAnchor.read(Circle).cy;
-      const prevBrAnchorX = brAnchor.read(Circle).cx;
-      const prevBrAnchorY = brAnchor.read(Circle).cy;
-      const { x, y } = api.canvas2Transformer(
-        {
-          x: canvasX,
-          y: canvasY,
-        },
-        mask,
-      );
-
-      let anchor: Entity;
-      const anchorName = resizingAnchorName;
-      if (anchorName === AnchorName.TOP_LEFT) {
-        anchor = tlAnchor;
-      } else if (anchorName === AnchorName.TOP_RIGHT) {
-        anchor = trAnchor;
-      } else if (anchorName === AnchorName.BOTTOM_LEFT) {
-        anchor = blAnchor;
-      } else if (anchorName === AnchorName.BOTTOM_RIGHT) {
-        anchor = brAnchor;
-      }
-
-      if (anchor) {
-        if (!flipEnabled) {
-          if (anchor === tlAnchor) {
-            Object.assign(anchor.write(Circle), {
-              cx: Math.min(x, trAnchor.read(Circle).cx),
-              cy: Math.min(y, blAnchor.read(Circle).cy),
-            });
-          } else if (anchor === trAnchor) {
-            Object.assign(anchor.write(Circle), {
-              cx: Math.max(x, tlAnchor.read(Circle).cx),
-              cy: Math.min(y, blAnchor.read(Circle).cy),
-            });
-          } else if (anchor === blAnchor) {
-            Object.assign(anchor.write(Circle), {
-              cx: Math.min(x, trAnchor.read(Circle).cx),
-              cy: Math.max(y, tlAnchor.read(Circle).cy),
-            });
-          } else if (anchor === brAnchor) {
-            Object.assign(anchor.write(Circle), {
-              cx: Math.max(x, tlAnchor.read(Circle).cx),
-              cy: Math.max(y, tlAnchor.read(Circle).cy),
-            });
-          }
-        } else {
-          Object.assign(anchor.write(Circle), {
-            cx: x,
-            cy: y,
-          });
-        }
-      }
-
-      let newHypotenuse: number;
-
-      if (anchorName === AnchorName.TOP_LEFT) {
-        if (lockAspectRatio) {
-          const comparePoint = centeredScaling
-            ? {
-              x: obb.width / 2,
-              y: obb.height / 2,
-            }
-            : {
-              x: brAnchor.read(Circle).cx,
-              y: brAnchor.read(Circle).cy,
-            };
-          newHypotenuse = Math.sqrt(
-            Math.pow(comparePoint.x - x, 2) + Math.pow(comparePoint.y - y, 2),
-          );
-
-          const { cx, cy } = tlAnchor.read(Circle);
-          const reverseX = cx > comparePoint.x ? -1 : 1;
-          const reverseY = cy > comparePoint.y ? -1 : 1;
-
-          Object.assign(tlAnchor.write(Circle), {
-            cx: comparePoint.x - newHypotenuse * cos * reverseX,
-            cy: comparePoint.y - newHypotenuse * sin * reverseY,
-          });
-        }
-      } else if (anchorName === AnchorName.TOP_RIGHT) {
-        if (lockAspectRatio) {
-          const comparePoint = centeredScaling
-            ? {
-              x: obb.width / 2,
-              y: obb.height / 2,
-            }
-            : {
-              x: blAnchor.read(Circle).cx,
-              y: blAnchor.read(Circle).cy,
-            };
-
-          newHypotenuse = Math.sqrt(
-            Math.pow(x - comparePoint.x, 2) + Math.pow(comparePoint.y - y, 2),
-          );
-
-          const { cx, cy } = trAnchor.read(Circle);
-          const reverseX = cx < comparePoint.x ? -1 : 1;
-          const reverseY = cy > comparePoint.y ? -1 : 1;
-
-          Object.assign(trAnchor.write(Circle), {
-            cx: comparePoint.x + newHypotenuse * cos * reverseX,
-            cy: comparePoint.y - newHypotenuse * sin * reverseY,
-          });
-        }
-
-        tlAnchor.write(Circle).cy = trAnchor.read(Circle).cy;
-        brAnchor.write(Circle).cx = trAnchor.read(Circle).cx;
-      } else if (anchorName === AnchorName.BOTTOM_LEFT) {
-        if (lockAspectRatio) {
-          const comparePoint = centeredScaling
-            ? {
-              x: obb.width / 2,
-              y: obb.height / 2,
-            }
-            : {
-              x: trAnchor.read(Circle).cx,
-              y: trAnchor.read(Circle).cy,
-            };
-
-          newHypotenuse = Math.sqrt(
-            Math.pow(comparePoint.x - x, 2) + Math.pow(y - comparePoint.y, 2),
-          );
-
-          const reverseX = comparePoint.x < x ? -1 : 1;
-          const reverseY = y < comparePoint.y ? -1 : 1;
-
-          Object.assign(blAnchor.write(Circle), {
-            cx: comparePoint.x - newHypotenuse * cos * reverseX,
-            cy: comparePoint.y + newHypotenuse * sin * reverseY,
-          });
-        }
-
-        tlAnchor.write(Circle).cx = blAnchor.read(Circle).cx;
-        brAnchor.write(Circle).cy = blAnchor.read(Circle).cy;
-      } else if (anchorName === AnchorName.BOTTOM_RIGHT) {
-        if (lockAspectRatio) {
-          const comparePoint = centeredScaling
-            ? {
-              x: obb.width / 2,
-              y: obb.height / 2,
-            }
-            : {
-              x: tlAnchor.read(Circle).cx,
-              y: tlAnchor.read(Circle).cy,
-            };
-
-          newHypotenuse = Math.sqrt(
-            Math.pow(x - comparePoint.x, 2) + Math.pow(y - comparePoint.y, 2),
-          );
-
-          const reverseX = brAnchor.read(Circle).cx < comparePoint.x ? -1 : 1;
-          const reverseY = brAnchor.read(Circle).cy < comparePoint.y ? -1 : 1;
-          Object.assign(brAnchor.write(Circle), {
-            cx: comparePoint.x + newHypotenuse * cos * reverseX,
-            cy: comparePoint.y + newHypotenuse * sin * reverseY,
-          });
-        }
-      } else if (anchorName === AnchorName.TOP_CENTER) {
-        if (!flipEnabled) {
-          tlAnchor.write(Circle).cy = Math.min(y, brAnchor.read(Circle).cy);
-        } else {
-          tlAnchor.write(Circle).cy = y;
-        }
-        tlAnchor.write(Circle).cy = y;
-      } else if (anchorName === AnchorName.BOTTOM_CENTER) {
-        if (!flipEnabled) {
-          brAnchor.write(Circle).cy = Math.max(y, tlAnchor.read(Circle).cy);
-        } else {
-          brAnchor.write(Circle).cy = y;
-        }
-      } else if (anchorName === AnchorName.MIDDLE_LEFT) {
-        if (!flipEnabled) {
-          tlAnchor.write(Circle).cx = Math.min(x, brAnchor.read(Circle).cx);
-        } else {
-          tlAnchor.write(Circle).cx = x;
-        }
-      } else if (anchorName === AnchorName.MIDDLE_RIGHT) {
-        if (!flipEnabled) {
-          brAnchor.write(Circle).cx = Math.max(x, tlAnchor.read(Circle).cx);
-        } else {
-          brAnchor.write(Circle).cx = x;
-        }
-      }
-
-      if (lockAspectRatio) {
-        if (
-          anchorName === AnchorName.MIDDLE_LEFT ||
-          anchorName === AnchorName.MIDDLE_RIGHT
-        ) {
-          const newWidth = brAnchor.read(Circle).cx - tlAnchor.read(Circle).cx;
-          const tan = sin / cos;
-          const newHeight = newWidth * tan;
-          const deltaY = newHeight - (prevBrAnchorY - prevTlAnchorY);
-          brAnchor.write(Circle).cy = brAnchor.read(Circle).cy + deltaY / 2;
-          tlAnchor.write(Circle).cy = tlAnchor.read(Circle).cy - deltaY / 2;
-        } else if (
-          anchorName === AnchorName.TOP_CENTER ||
-          anchorName === AnchorName.BOTTOM_CENTER
-        ) {
-          const newHeight = brAnchor.read(Circle).cy - tlAnchor.read(Circle).cy;
-          const tan = sin / cos;
-          const newWidth = newHeight / tan;
-          const deltaX = newWidth - (prevBrAnchorX - prevTlAnchorX);
-          brAnchor.write(Circle).cx = brAnchor.read(Circle).cx + deltaX / 2;
-          tlAnchor.write(Circle).cx = tlAnchor.read(Circle).cx - deltaX / 2;
-        }
-      }
-
-      if (centeredScaling) {
-        const topOffsetX = tlAnchor.read(Circle).cx - prevTlAnchorX;
-        const topOffsetY = tlAnchor.read(Circle).cy - prevTlAnchorY;
-
-        const bottomOffsetX = brAnchor.read(Circle).cx - prevBrAnchorX;
-        const bottomOffsetY = brAnchor.read(Circle).cy - prevBrAnchorY;
-
-        Object.assign(brAnchor.write(Circle), {
-          cx: brAnchor.read(Circle).cx - topOffsetX,
-          cy: brAnchor.read(Circle).cy - topOffsetY,
-        });
-
-        Object.assign(tlAnchor.write(Circle), {
-          cx: tlAnchor.read(Circle).cx - bottomOffsetX,
-          cy: tlAnchor.read(Circle).cy - bottomOffsetY,
-        });
-      }
-
-      const { cx: tlCx, cy: tlCy } = tlAnchor.read(Circle);
-      const { cx: brCx, cy: brCy } = brAnchor.read(Circle);
-
-      {
-        const width = brCx - tlCx;
-        const height = brCy - tlCy;
-
-        if (!flipEnabled && (width <= 0 || height <= 0)) {
-          return;
-        }
-
-        const { x, y } = api.transformer2Canvas({ x: tlCx, y: tlCy }, mask);
-
-        this.fitSelected(
-          api,
-          {
-            x,
-            y,
-            width,
-            height,
-            rotation,
-            scaleX,
-            scaleY,
-          },
-          selection,
-        );
-
-        showLabel(label, api, { x, y, width, height });
-      }
+    let anchor: Entity;
+    if (anchorName === AnchorName.TOP_LEFT) {
+      anchor = tlAnchor;
+    } else if (anchorName === AnchorName.TOP_RIGHT) {
+      anchor = trAnchor;
+    } else if (anchorName === AnchorName.BOTTOM_LEFT) {
+      anchor = blAnchor;
+    } else if (anchorName === AnchorName.BOTTOM_RIGHT) {
+      anchor = brAnchor;
     }
+
+    if (anchor) {
+      Object.assign(anchor.write(Circle), {
+        cx: x,
+        cy: y,
+      });
+    }
+
+    let newHypotenuse: number;
+
+    if (anchorName === AnchorName.TOP_LEFT) {
+      const comparePoint = {
+        x: brAnchor.read(Circle).cx,
+        y: brAnchor.read(Circle).cy,
+      };
+      newHypotenuse = Math.sqrt(
+        Math.pow(comparePoint.x - x, 2) + Math.pow(comparePoint.y - y, 2),
+      );
+
+      const { cx, cy } = tlAnchor.read(Circle);
+      const reverseX = cx > comparePoint.x ? -1 : 1;
+      const reverseY = cy > comparePoint.y ? -1 : 1;
+
+      Object.assign(tlAnchor.write(Circle), {
+        cx: comparePoint.x - newHypotenuse * cos * reverseX,
+        cy: comparePoint.y - newHypotenuse * sin * reverseY,
+      });
+    } else if (anchorName === AnchorName.TOP_RIGHT) {
+      const comparePoint = {
+        x: blAnchor.read(Circle).cx,
+        y: blAnchor.read(Circle).cy,
+      };
+
+      newHypotenuse = Math.sqrt(
+        Math.pow(x - comparePoint.x, 2) + Math.pow(comparePoint.y - y, 2),
+      );
+
+      const { cx, cy } = trAnchor.read(Circle);
+      const reverseX = cx < comparePoint.x ? -1 : 1;
+      const reverseY = cy > comparePoint.y ? -1 : 1;
+
+      Object.assign(trAnchor.write(Circle), {
+        cx: comparePoint.x + newHypotenuse * cos * reverseX,
+        cy: comparePoint.y - newHypotenuse * sin * reverseY,
+      });
+
+      tlAnchor.write(Circle).cy = trAnchor.read(Circle).cy;
+      brAnchor.write(Circle).cx = trAnchor.read(Circle).cx;
+    } else if (anchorName === AnchorName.BOTTOM_LEFT) {
+      const comparePoint = {
+        x: trAnchor.read(Circle).cx,
+        y: trAnchor.read(Circle).cy,
+      };
+
+      newHypotenuse = Math.sqrt(
+        Math.pow(comparePoint.x - x, 2) + Math.pow(y - comparePoint.y, 2),
+      );
+
+      const reverseX = comparePoint.x < x ? -1 : 1;
+      const reverseY = y < comparePoint.y ? -1 : 1;
+
+      Object.assign(blAnchor.write(Circle), {
+        cx: comparePoint.x - newHypotenuse * cos * reverseX,
+        cy: comparePoint.y + newHypotenuse * sin * reverseY,
+      });
+
+      tlAnchor.write(Circle).cx = blAnchor.read(Circle).cx;
+      brAnchor.write(Circle).cy = blAnchor.read(Circle).cy;
+    } else if (anchorName === AnchorName.BOTTOM_RIGHT) {
+      const comparePoint = {
+        x: tlAnchor.read(Circle).cx,
+        y: tlAnchor.read(Circle).cy,
+      };
+
+      newHypotenuse = Math.sqrt(
+        Math.pow(x - comparePoint.x, 2) + Math.pow(y - comparePoint.y, 2),
+      );
+
+      const reverseX = brAnchor.read(Circle).cx < comparePoint.x ? -1 : 1;
+      const reverseY = brAnchor.read(Circle).cy < comparePoint.y ? -1 : 1;
+      Object.assign(brAnchor.write(Circle), {
+        cx: comparePoint.x + newHypotenuse * cos * reverseX,
+        cy: comparePoint.y + newHypotenuse * sin * reverseY,
+      });
+    } else if (anchorName === AnchorName.TOP_CENTER) {
+      tlAnchor.write(Circle).cy = y;
+    } else if (anchorName === AnchorName.BOTTOM_CENTER) {
+      brAnchor.write(Circle).cy = y;
+    } else if (anchorName === AnchorName.MIDDLE_LEFT) {
+      tlAnchor.write(Circle).cx = x;
+    } else if (anchorName === AnchorName.MIDDLE_RIGHT) {
+      brAnchor.write(Circle).cx = x;
+    }
+
+    // Aspect ratio enforcement for edge anchors.
+    // Guard against degenerate cos/sin to avoid division by zero.
+    if (
+      anchorName === AnchorName.MIDDLE_LEFT ||
+      anchorName === AnchorName.MIDDLE_RIGHT
+    ) {
+      if (cos < 1e-10) return;
+      const newWidth = brAnchor.read(Circle).cx - tlAnchor.read(Circle).cx;
+      const tan = sin / cos;
+      const newHeight = Math.abs(newWidth) * tan;
+      const deltaY = newHeight - (prevBrAnchorY - prevTlAnchorY);
+      brAnchor.write(Circle).cy = brAnchor.read(Circle).cy + deltaY / 2;
+      tlAnchor.write(Circle).cy = tlAnchor.read(Circle).cy - deltaY / 2;
+    } else if (
+      anchorName === AnchorName.TOP_CENTER ||
+      anchorName === AnchorName.BOTTOM_CENTER
+    ) {
+      if (cos < 1e-10 || sin < 1e-10) return;
+      const newHeight = brAnchor.read(Circle).cy - tlAnchor.read(Circle).cy;
+      const tan = sin / cos;
+      const newWidth = Math.abs(newHeight) / tan;
+      const deltaX = newWidth - (prevBrAnchorX - prevTlAnchorX);
+      brAnchor.write(Circle).cx = brAnchor.read(Circle).cx + deltaX / 2;
+      tlAnchor.write(Circle).cx = tlAnchor.read(Circle).cx - deltaX / 2;
+    }
+  }
+
+  /**
+   * Compute new OBB from saved mask matrix and apply to selected nodes.
+   */
+  private computeOBBFromSavedMask(
+    api: API,
+    anchorName: AnchorName,
+    x: number,
+    y: number,
+    cos: number,
+    sin: number,
+    selection: SelectOBB,
+  ) {
+    if (!selection.savedMaskMatrix) return;
+
+    const savedW = selection.obb.width;
+    const savedH = selection.obb.height;
+    const { rotation, scaleX, scaleY } = selection.obb;
+
+    // Guard against degenerate OBB to avoid division by zero.
+    if (savedW < 1e-10 || savedH < 1e-10) return;
+
+    let width: number;
+    let height: number;
+    let minX: number;
+    let minY: number;
+
+    if (
+      anchorName === AnchorName.MIDDLE_LEFT ||
+      anchorName === AnchorName.MIDDLE_RIGHT
+    ) {
+      const fixedX = anchorName === AnchorName.MIDDLE_RIGHT ? 0 : savedW;
+      width = Math.abs(x - fixedX);
+      height = width * (savedH / savedW);
+      minX = Math.min(x, fixedX);
+      const centerY = savedH / 2;
+      minY = centerY - height / 2;
+    } else if (
+      anchorName === AnchorName.TOP_CENTER ||
+      anchorName === AnchorName.BOTTOM_CENTER
+    ) {
+      const fixedY = anchorName === AnchorName.BOTTOM_CENTER ? 0 : savedH;
+      height = Math.abs(y - fixedY);
+      width = height * (savedW / savedH);
+      minY = Math.min(y, fixedY);
+      const centerX = savedW / 2;
+      minX = centerX - width / 2;
+    } else {
+      // 角锚点：对角固定，等比缩放
+      let fixedLocalX: number;
+      let fixedLocalY: number;
+      if (anchorName === AnchorName.BOTTOM_RIGHT) {
+        fixedLocalX = 0;
+        fixedLocalY = 0;
+      } else if (anchorName === AnchorName.TOP_LEFT) {
+        fixedLocalX = savedW;
+        fixedLocalY = savedH;
+      } else if (anchorName === AnchorName.TOP_RIGHT) {
+        fixedLocalX = 0;
+        fixedLocalY = savedH;
+      } else {
+        // BOTTOM_LEFT
+        fixedLocalX = savedW;
+        fixedLocalY = 0;
+      }
+
+      const dx = x - fixedLocalX;
+      const dy = y - fixedLocalY;
+      const hyp = Math.sqrt(dx * dx + dy * dy);
+      width = hyp * cos;
+      height = hyp * sin;
+
+      const rx = dx >= 0 ? 1 : -1;
+      const ry = dy >= 0 ? 1 : -1;
+      const cornerX = fixedLocalX + width * rx;
+      const cornerY = fixedLocalY + height * ry;
+      minX = Math.min(fixedLocalX, cornerX);
+      minY = Math.min(fixedLocalY, cornerY);
+    }
+
+    if (width < 0.01 && height < 0.01) {
+      return;
+    }
+
+    // 将保存的 mask 本地坐标转换为画布坐标
+    const originInCanvas = vec2.transformMat3(
+      vec2.create(),
+      [minX, minY],
+      selection.savedMaskMatrix,
+    );
+    const ox = originInCanvas[0];
+    const oy = originInCanvas[1];
+
+    this.fitSelected(
+      api,
+      {
+        x: ox,
+        y: oy,
+        width,
+        height,
+        rotation,
+        scaleX,
+        scaleY,
+      },
+      selection,
+    );
+
+    // 立即同步更新 mask 的 Transform、Rect 和锚点，避免等到
+    // RenderTransformer 使用过时的 ComputedBounds 来更新（滞后一帧）。
+    const camera = api.getCamera();
+    syncMaskTransform(camera, {
+      x: ox,
+      y: oy,
+      width,
+      height,
+      rotation,
+      scaleX,
+      scaleY,
+    });
   }
 
   private handleSelectedResized(api: API, selection: SelectOBB) {
@@ -688,13 +624,11 @@ export class Select extends System {
     const { selecteds } = camera.read(Transformable);
     selecteds.forEach((selected) => {
       if (!selected.has(Highlighted)) {
-        selected.add(Highlighted);
+        selected.add(Highlighted, { strokeWidth: 1 });
       }
     });
 
     this.saveSelectedOBB(api, selection);
-
-    hideLabel(selection.label);
   }
 
   private handleSelectedRotated(api: API, selection: SelectOBB) {
@@ -707,7 +641,7 @@ export class Select extends System {
     const { selecteds } = camera.read(Transformable);
     selecteds.forEach((selected) => {
       if (!selected.has(Highlighted)) {
-        selected.add(Highlighted);
+        selected.add(Highlighted, { strokeWidth: 1 });
       }
     });
 
@@ -782,9 +716,9 @@ export class Select extends System {
         const selection = {
           mode: SelectionMode.IDLE,
           resizingAnchorName: AnchorName.INSIDE,
-          nodes: api.getNodes().map(node => ({
+          nodes: api.getNodes().map((node) => ({
             ...node,
-            ...api.getAbsoluteTransformAndSize(node)
+            ...api.getAbsoluteTransformAndSize(node),
           })),
           obb: {
             x: 0,
@@ -799,10 +733,16 @@ export class Select extends System {
           cos: 0,
           pointerMoveViewportX: 0,
           pointerMoveViewportY: 0,
+          pointerDownViewportX: 0,
+          pointerDownViewportY: 0,
+          pointerDownShiftKey: false,
+          pointerDownSelectionHandled: false,
           brushContainer: createSVGElement('svg') as SVGSVGElement,
           snapContainer: createSVGElement('svg') as SVGSVGElement,
-          label: DOMAdapter.get().getDocument().createElement('div'),
           editing: undefined,
+          savedMaskMatrix: null,
+          savedMaskMatrixInv: null,
+          prevHoverEntity: undefined,
         };
         this.selections.set(camera.__id, selection);
 
@@ -816,48 +756,17 @@ export class Select extends System {
           if ($svgLayer) {
             $svgLayer.appendChild(selection.brushContainer);
             $svgLayer.appendChild(selection.snapContainer);
-
-            const { label } = selection;
-            initLabel(label);
-            $svgLayer.appendChild(selection.label);
           }
         }
       }
 
-      // if (input.doubleClickTrigger) {
-      //   // FIXME: Only support Polyline for now
-      //   const { selecteds } = camera.read(Transformable);
-      //   if (selecteds.length === 1) {
-      //     const selected = selecteds[0];
-
-      //     const selection = this.selections.get(camera.__id);
-      //     selection.mode = SelectionMode.EDITING;
-
-      //     // Enter edit mode
-      //     api.updateNode(api.getNodeByEntity(selected), { isEditing: true });
-      //     selection.editing = selected;
-
-      //     if (selected.has(Polyline)) {
-      //       const vectorNetwork = VectorNetwork.fromEntity(selected);
-      //       safeRemoveComponent(selected, Polyline);
-
-      //       api.runAtNextTick(() => {
-      //         safeAddComponent(selected, VectorNetwork, vectorNetwork);
-      //       });
-
-      //       // Enter VectorNetwork edit mode
-      //       api.setAppState({
-      //         penbarSelected: Pen.VECTOR_NETWORK,
-      //       });
-      //     }
-
-      //     return;
-      //   }
-      // }
-
       const selection = this.selections.get(camera.__id);
       if (input.pointerDownTrigger) {
         const [x, y] = input.pointerViewport;
+        selection.pointerDownViewportX = x;
+        selection.pointerDownViewportY = y;
+        selection.pointerDownShiftKey = input.shiftKey;
+        selection.pointerDownSelectionHandled = false;
 
         if (selection.editing) {
           if (selection.mode === SelectionMode.IDLE) {
@@ -883,9 +792,20 @@ export class Select extends System {
           selection.mode = SelectionMode.READY_TO_BRUSH;
           api.selectNodes([]);
         } else if (selection.mode === SelectionMode.READY_TO_SELECT) {
-          selection.mode = SelectionMode.SELECT;
+          const { selecteds: existingSelecteds } = camera.read(Transformable);
+          if (existingSelecteds.length > 0) {
+            // Check if pointer is inside the transformer box.
+            const ht = hitTest(api, { x, y });
+            if (ht?.anchor === AnchorName.INSIDE) {
+              selection.mode = SelectionMode.MOVE;
+            } else {
+              // Outside transformer — select immediately on pointerDown.
+              selection.mode = SelectionMode.SELECT;
+            }
+          } else {
+            selection.mode = SelectionMode.SELECT;
+          }
         } else if (selection.mode === SelectionMode.READY_TO_MOVE) {
-          cursor.value = 'grab';
           selection.mode = SelectionMode.MOVE;
         } else if (
           selection.mode === SelectionMode.READY_TO_RESIZE ||
@@ -897,10 +817,6 @@ export class Select extends System {
           } else if (selection.mode === SelectionMode.READY_TO_ROTATE) {
             selection.mode = SelectionMode.ROTATE;
           }
-          // } else if (
-          //   selection.mode === SelectionMode.READY_TO_MOVE_CONTROL_POINT
-          // ) {
-          //   selection.mode = SelectionMode.MOVE_CONTROL_POINT;
         }
 
         if (selection.mode === SelectionMode.SELECT) {
@@ -909,14 +825,15 @@ export class Select extends System {
             const selected = api.getNodeByEntity(toSelect);
             if (selected) {
               if (
-                api.getAppState().layersSelected.length > 1 &&
+                input.shiftKey &&
                 api.getAppState().layersSelected.includes(selected.id)
               ) {
-                // deselect if already selected in a group
+                // Shift-click toggles: remove if already selected.
                 api.deselectNodes([selected]);
               } else {
                 api.selectNodes([selected], input.shiftKey); // single or multi select
               }
+              selection.pointerDownSelectionHandled = true;
             }
           }
 
@@ -929,25 +846,32 @@ export class Select extends System {
       let toHighlight: Entity | undefined;
       if (camera.has(ComputedCamera) && inputPoints.length === 0) {
         const [x, y] = input.pointerViewport;
-        if (
-          selection.pointerMoveViewportX !== x &&
-          selection.pointerMoveViewportY !== y
-        ) {
+        const shouldRecomputeHover =
+          selection.pointerMoveViewportX !== x ||
+          selection.pointerMoveViewportY !== y ||
+          input.pointerDownTrigger ||
+          input.pointerUpTrigger;
+        if (shouldRecomputeHover) {
           selection.pointerMoveViewportX = x;
           selection.pointerMoveViewportY = y;
-
-          api.highlightNodes([]);
 
           // Highlight the topmost non-ui element
           toHighlight = this.getTopmostEntity(api, x, y, (e) => !e.has(UI));
           if (toHighlight) {
             if (
               selection.mode !== SelectionMode.BRUSH &&
-              selection.mode !== SelectionMode.MOVE
+              selection.mode !== SelectionMode.MOVE &&
+              selection.mode !== SelectionMode.RESIZE &&
+              selection.mode !== SelectionMode.ROTATE
             ) {
               selection.mode = SelectionMode.READY_TO_SELECT;
             }
-          } else if (selection.mode !== SelectionMode.BRUSH) {
+          } else if (
+            selection.mode !== SelectionMode.BRUSH &&
+            selection.mode !== SelectionMode.RESIZE &&
+            selection.mode !== SelectionMode.ROTATE &&
+            selection.mode !== SelectionMode.MOVE
+          ) {
             selection.mode = SelectionMode.IDLE;
           }
           const { mask, selecteds } = camera.read(Transformable);
@@ -958,69 +882,80 @@ export class Select extends System {
           if (selecteds.length >= 1) {
             const { anchor, cursor: cursorName } = hitTest(api, { x, y }) || {};
 
-            if (selection.mode !== SelectionMode.BRUSH) {
+            if (
+              selection.mode !== SelectionMode.BRUSH &&
+              selection.mode !== SelectionMode.MOVE &&
+              selection.mode !== SelectionMode.RESIZE &&
+              selection.mode !== SelectionMode.ROTATE
+            ) {
               if (anchor) {
-                if (anchor === AnchorName.CONTROL) {
-                  // cursor.value = 'move';
-                  // (selection as SelectVectorNetwork).activeControlPointIndex =
-                  //   index;
-                } else {
-                  const { rotation, scale } = mask.read(Transform);
-                  cursor.value =
-                    getCursor(
-                      cursorName,
-                      rotation,
-                      '',
-                      Math.sign(scale[0] * scale[1]) < 0,
-                    ) ?? cursorName;
-                  selection.resizingAnchorName = anchor;
+                const { rotation, scale } = mask.read(Transform);
+                cursor.value =
+                  getCursor(
+                    cursorName,
+                    rotation,
+                    '',
+                    Math.sign(scale[0] * scale[1]) < 0,
+                  ) ?? cursorName;
+                selection.resizingAnchorName = anchor;
 
-                  if (cursorName.includes('rotate')) {
-                    selection.mode = SelectionMode.READY_TO_ROTATE;
-                    toHighlight = undefined;
-                  } else if (
-                    cursorName.includes('resize') ||
-                    anchor === AnchorName.X1Y1 ||
-                    anchor === AnchorName.X2Y2
-                  ) {
-                    selection.mode = SelectionMode.READY_TO_RESIZE;
-                    toHighlight = undefined;
-                  } else if (anchor === AnchorName.INSIDE) {
-                    // Only in single transformer, we can select other objects.
-                    if (
-                      toHighlight &&
-                      toHighlight !== selecteds[0] &&
-                      selecteds.length === 1
-                    ) {
+                if (cursorName.includes('rotate')) {
+                  selection.mode = SelectionMode.READY_TO_ROTATE;
+                  toHighlight = undefined;
+                } else if (cursorName.includes('resize')) {
+                  selection.mode = SelectionMode.READY_TO_RESIZE;
+                  toHighlight = undefined;
+                } else if (anchor === AnchorName.INSIDE) {
+                  // Allow hover highlight for non-selected elements inside the transformer.
+                  if (toHighlight && !selecteds.includes(toHighlight)) {
+                    selection.mode = SelectionMode.READY_TO_SELECT;
+                  } else {
+                    // In group can toggle selection.
+                    if (input.shiftKey) {
                       selection.mode = SelectionMode.READY_TO_SELECT;
                     } else {
-                      // In group can toggle selection.
-                      if (input.shiftKey) {
-                        selection.mode = SelectionMode.READY_TO_SELECT;
-                      } else {
-                        // Disable highlight, only allow move.
-                        toHighlight = undefined;
+                      // Disable highlight, only allow move.
+                      toHighlight = undefined;
 
-                        if (
-                          // selection.mode !== SelectionMode.BRUSH &&
-                          selection.mode !== SelectionMode.MOVE
-                        ) {
-                          selection.mode = SelectionMode.READY_TO_MOVE;
-                        }
-                      }
+                      selection.mode = SelectionMode.READY_TO_MOVE;
                     }
-                  } else if (toHighlight) {
-                    selection.mode = SelectionMode.READY_TO_SELECT;
                   }
+                } else if (toHighlight) {
+                  selection.mode = SelectionMode.READY_TO_SELECT;
                 }
               }
             }
           }
 
-          if (toHighlight) {
-            const node = api.getNodeByEntity(toHighlight);
-            if (node) {
-              api.highlightNodes([node]);
+          // Only rebuild highlight list when hover target changes to avoid
+          // per-frame allocation and redundant highlightNodes calls.
+          if (
+            toHighlight !== selection.prevHoverEntity ||
+            input.pointerDownTrigger ||
+            input.pointerUpTrigger
+          ) {
+            selection.prevHoverEntity = toHighlight;
+
+            const selectedNodeIds = selecteds
+              .map((e) => api.getNodeByEntity(e))
+              .filter(Boolean)
+              .map((n) => n.id);
+            const hoverNode = toHighlight
+              ? api.getNodeByEntity(toHighlight)
+              : undefined;
+            const highlightIds =
+              hoverNode && !selectedNodeIds.includes(hoverNode.id)
+                ? [...selectedNodeIds, hoverNode.id]
+                : selectedNodeIds;
+            api.highlightNodes(highlightIds, false, true, 1);
+            // Hover gets thicker stroke to distinguish from selection highlight.
+            if (
+              hoverNode &&
+              toHighlight &&
+              toHighlight.has(Highlighted) &&
+              !selecteds.includes(toHighlight)
+            ) {
+              toHighlight.write(Highlighted).strokeWidth = 2;
             }
           }
         }
@@ -1062,22 +997,23 @@ export class Select extends System {
           this.handleBrushing(api, x, y);
           selection.mode = SelectionMode.BRUSH;
         } else if (selection.mode === SelectionMode.MOVE) {
-          cursor.value = 'grabbing';
-
-          this.handleSelectedMoving(api, sx, sy, ex, ey);
-        } else if (selection.mode === SelectionMode.RESIZE) {
-          this.handleSelectedResizing(
-            api,
-            ex,
-            ey,
-            input.shiftKey,
-            input.altKey,
-            selection,
+          // Only start actual moving after exceeding drag threshold (3px).
+          // This prevents micro-movements during clicks from changing state
+          // (status, visibility) that would be left dangling if the pointerUp
+          // handler treats the gesture as a click instead of a drag.
+          const dist = distanceBetweenPoints(
+            x,
+            y,
+            selection.pointerDownViewportX,
+            selection.pointerDownViewportY,
           );
+          if (dist >= DRAG_THRESHOLD) {
+            this.handleSelectedMoving(api, sx, sy, ex, ey);
+          }
+        } else if (selection.mode === SelectionMode.RESIZE) {
+          this.handleSelectedResizing(api, ex, ey, selection);
         } else if (selection.mode === SelectionMode.ROTATE) {
-          this.handleSelectedRotating(api, ex, ey);
-          // } else if (selection.mode === SelectionMode.MOVE_CONTROL_POINT) {
-          // this.handleSelectedMovingControlPoint(api, sx, sy, ex, ey);
+          // 暂时不支持旋转
         }
       });
 
@@ -1092,9 +1028,48 @@ export class Select extends System {
       if (input.pointerUpTrigger) {
         if (selection.mode === SelectionMode.BRUSH) {
           this.hideBrush(selection);
-          this.applyBrushSelection(api, selection, false);
+          this.applyBrushSelection(api, selection, true);
         } else if (selection.mode === SelectionMode.MOVE) {
-          this.handleSelectedMoved(api, selection);
+          const [upX, upY] = input.pointerViewport;
+          const dragDist = distanceBetweenPoints(
+            upX,
+            upY,
+            selection.pointerDownViewportX,
+            selection.pointerDownViewportY,
+          );
+
+          if (dragDist < DRAG_THRESHOLD) {
+            // Below threshold → treat as click, select element under cursor.
+            const toSelect = this.getTopmostEntity(
+              api,
+              upX,
+              upY,
+              (e) => !e.has(UI),
+            );
+            if (toSelect) {
+              const selected = api.getNodeByEntity(toSelect);
+              if (selected) {
+                if (selection.pointerDownSelectionHandled) {
+                  // Selection already handled on pointerDown for this click.
+                  selection.pointerDownSelectionHandled = false;
+                } else {
+                  if (
+                    selection.pointerDownShiftKey &&
+                    api.getAppState().layersSelected.includes(selected.id)
+                  ) {
+                    // Shift-click toggles: remove if already selected.
+                    api.deselectNodes([selected]);
+                  } else {
+                    api.selectNodes([selected], selection.pointerDownShiftKey);
+                  }
+                }
+              }
+            }
+            selection.pointerDownSelectionHandled = false;
+          } else {
+            // Real drag — commit the move.
+            this.handleSelectedMoved(api, selection);
+          }
           selection.mode = SelectionMode.READY_TO_MOVE;
         } else if (
           selection.mode === SelectionMode.RESIZE ||
@@ -1105,12 +1080,6 @@ export class Select extends System {
         } else if (selection.mode === SelectionMode.ROTATE) {
           this.handleSelectedRotated(api, selection);
           selection.mode = SelectionMode.READY_TO_ROTATE;
-          // } else if (selection.mode === SelectionMode.MOVE_CONTROL_POINT) {
-          //   this.handleSelectedMovedControlPoint(
-          //     api,
-          //     selection as SelectVectorNetwork,
-          //   );
-          //   selection.mode = SelectionMode.READY_TO_MOVE_CONTROL_POINT;
         }
 
         if (isBrowser) {
@@ -1121,10 +1090,9 @@ export class Select extends System {
   }
 
   finalize(): void {
-    this.selections.forEach(({ brushContainer, snapContainer, label }) => {
+    this.selections.forEach(({ brushContainer, snapContainer }) => {
       brushContainer.remove();
       snapContainer.remove();
-      label.remove();
     });
     this.selections.clear();
   }
@@ -1159,7 +1127,12 @@ export class Select extends System {
         .map((e) => api.getNodeByEntity(e));
       api.selectNodes(selecteds);
       if (needHighlight) {
-        api.highlightNodes(selecteds);
+        api.highlightNodes(
+          selecteds.map((n) => n.id),
+          false,
+          true,
+          1,
+        );
       }
     }
   }
@@ -1178,12 +1151,33 @@ export class Select extends System {
     };
     const { width, height } = selection.obb;
     const hypotenuse = Math.sqrt(Math.pow(width, 2) + Math.pow(height, 2));
-    selection.sin = Math.abs(height / hypotenuse);
-    selection.cos = Math.abs(width / hypotenuse);
-    selection.nodes = [...api.getNodes().map(node => ({
-      ...node,
-      ...api.getAbsoluteTransformAndSize(node)
-    }))];
+    if (hypotenuse < 1e-10) {
+      selection.sin = 0;
+      selection.cos = 1;
+    } else {
+      selection.sin = Math.abs(height / hypotenuse);
+      selection.cos = Math.abs(width / hypotenuse);
+    }
+    selection.nodes = [
+      ...api.getNodes().map((node) => ({
+        ...node,
+        ...api.getAbsoluteTransformAndSize(node),
+      })),
+    ];
+
+    // Save the mask's GlobalTransform at this point to use during resize.
+    // This prevents a feedback loop: node moves → mask follows → coordinate
+    // conversion drifts → node moves more.
+    const { mask } = camera.read(Transformable);
+    if (mask) {
+      selection.savedMaskMatrix = mat3.clone(
+        Mat3.toGLMat3(mask.read(GlobalTransform).matrix),
+      );
+      selection.savedMaskMatrixInv = mat3.invert(
+        mat3.create(),
+        selection.savedMaskMatrix,
+      );
+    }
   }
 
   private fitSelected(api: API, newAttrs: OBB, selection: SelectOBB) {
@@ -1200,6 +1194,7 @@ export class Select extends System {
       scaleX: selection.obb.scaleX,
       scaleY: selection.obb.scaleY,
     };
+
     const baseSize = 10000000;
     const oldTr = mat3.create();
     mat3.translate(oldTr, oldTr, [oldAttrs.x, oldAttrs.y]);
@@ -1212,20 +1207,10 @@ export class Select extends System {
     const newScaleX = newAttrs.width / baseSize;
     const newScaleY = newAttrs.height / baseSize;
 
-    const { flipEnabled } = api.getAppState();
-    if (flipEnabled) {
-      mat3.translate(newTr, newTr, [newAttrs.x, newAttrs.y]);
-      mat3.rotate(newTr, newTr, newAttrs.rotation);
-      mat3.scale(newTr, newTr, [newScaleX, newScaleY]);
-    } else {
-      mat3.translate(newTr, newTr, [newAttrs.x, newAttrs.y]);
-      mat3.rotate(newTr, newTr, newAttrs.rotation);
-      mat3.translate(newTr, newTr, [
-        newAttrs.width < 0 ? newAttrs.width : 0,
-        newAttrs.height < 0 ? newAttrs.height : 0,
-      ]);
-      mat3.scale(newTr, newTr, [Math.abs(newScaleX), Math.abs(newScaleY)]);
-    }
+    // Width and height are always positive after normalization.
+    mat3.translate(newTr, newTr, [newAttrs.x, newAttrs.y]);
+    mat3.rotate(newTr, newTr, newAttrs.rotation);
+    mat3.scale(newTr, newTr, [newScaleX, newScaleY]);
 
     // Borrow from Konva.js
     // @see https://github.com/konvajs/konva/blob/9a9bd00cd377a6d12cce3ee7c9fbf906afa55de5/src/shapes/Transformer.ts#L1103
@@ -1382,7 +1367,7 @@ export class Select extends System {
         });
         const distance = Math.sqrt(
           Math.pow(points[0][0] - points[1][0], 2) +
-          Math.pow(points[0][1] - points[1][1], 2),
+            Math.pow(points[0][1] - points[1][1], 2),
         );
         const from = [fromX, fromY] as [number, number];
         const to = [toX, toY] as [number, number];
