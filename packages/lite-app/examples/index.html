@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lite Canvas App</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        width: 100%;
+        height: 100%;
+      }
+
+      #canvas {
+        touch-action: none;
+        width: 100%;
+        height: 100%;
+      }
+
+      .zoom-toolbar {
+        position: fixed;
+        bottom: 16px;
+        right: 16px;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        background: var(--bg, #fff);
+        border: 1px solid var(--border, #e0e0e0);
+        border-radius: 8px;
+        padding: 4px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        font-size: 13px;
+        z-index: 100;
+        user-select: none;
+      }
+
+      .zoom-toolbar button {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        cursor: pointer;
+        font-size: 16px;
+        color: var(--text, #333);
+        transition: background 0.15s;
+      }
+
+      .zoom-toolbar button:hover {
+        background: var(--hover, #f0f0f0);
+      }
+
+      .zoom-toolbar .zoom-level {
+        min-width: 48px;
+        text-align: center;
+        color: var(--text, #333);
+        font-variant-numeric: tabular-nums;
+      }
+    </style>
+  </head>
+  <body>
+    <ic-spectrum-canvas
+      id="canvas"
+      renderer="webgl"
+    ></ic-spectrum-canvas>
+
+    <div class="zoom-toolbar">
+      <button id="zoom-out" title="Zoom Out">−</button>
+      <span id="zoom-level" class="zoom-level">100%</span>
+      <button id="zoom-in" title="Zoom In">+</button>
+      <button id="zoom-fit" title="Fit to Screen">⊡</button>
+    </div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

@@ -17,6 +17,7 @@
     "url": "https://github.com/xiaoiver"
   },
   "scripts": {
+    "dev": "pnpm --filter @infinite-canvas-tutorial/ecs build:cjs && pnpm --filter @infinite-canvas-tutorial/ecs watch & pnpm --filter @infinite-canvas-tutorial/webcomponents watch & pnpm --filter @infinite-canvas-tutorial/lite-app dev",
     "clean": "rimraf dist",
     "lint-staged": "lint-staged",
     "prepare": "husky install",
